@@ -1838,7 +1838,7 @@ def _wipe_caches(folder: str) -> None:
 
     - copy 模式：winners/ losers/ 是副本，原图还在根目录 → 直接删 winners/ losers/。
     - move 模式：winners/ losers/ 里就是原图本体 → 把文件搬回根目录再删空目录。
-    - 同时清掉 phash 缓存、session 进度、_pic_selecter/（日志/缩略图/skipped）。
+    - 清掉 session 进度与本次运行日志；保留可复用的分析缓存与缩略图缓存。
     """
     # 先读上次的 mode（在删 state 之前），决定 winners/losers 怎么处理。
     # 读不到时默认按 move 处理（先把文件搬回根目录再删空）—— 这样即使原本是
@@ -1882,10 +1882,17 @@ def _wipe_caches(folder: str) -> None:
 
     pd = pic_dir(folder)
     if pd.exists():
-        try:
-            shutil.rmtree(pd)
-        except OSError as e:
-            logger.warning(f"清 _pic_selecter 目录失败: {e}")
+        keep = {"cache.sqlite", "cache.sqlite-shm", "cache.sqlite-wal", "thumbs"}
+        for child in list(pd.iterdir()):
+            if child.name in keep:
+                continue
+            try:
+                if child.is_dir():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
+            except OSError as e:
+                logger.warning(f"清 _pic_selecter/{child.name} 失败: {e}")
 
 
 def _require_engine(engine: str) -> None:

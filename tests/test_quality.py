@@ -1,8 +1,10 @@
 import importlib
+import os
 import sys
 import types
 from pathlib import Path
 
+import numpy as np
 from PIL import Image, ImageFilter, ImageDraw
 
 from pic_selecter.quality import analyze_image
@@ -94,3 +96,53 @@ def test_scan_folder_pairs_raw_with_jpg_and_skips_root_outputs(tmp_path):
     assert simplified["IMG_0001.CR2"] == ["IMG_0001.JPG"]
     assert "old.jpg" not in simplified
     assert simplified["kept.jpg"] == []
+
+
+def test_compute_infos_reuses_fast_analysis_cache(tmp_path, monkeypatch):
+    grouper = importlib.import_module("pic_selecter.grouper")
+    img_path = tmp_path / "sample.jpg"
+    checkerboard().save(img_path)
+    calls = []
+
+    def fake_process(path, strength="standard", face_aware=True, engine="expert",
+                     llm_model=None, companions=None, cache_folder=None):
+        calls.append(path)
+        st = os.stat(path)
+        return grouper.ImageInfo(
+            path=path,
+            phash="a" * 16,
+            timestamp=None,
+            size=st.st_size,
+            mtime=st.st_mtime,
+            exif_summary={"width": 256, "height": 256, "file_size": st.st_size},
+            quality={"quality_score": 88.0, "flags": [], "auto_reject": False},
+            companions=list(companions or []),
+            dhash="b" * 16,
+            whash="c" * 16,
+            ahash="d" * 16,
+            color_hist=np.array([1.0, 0.0], dtype=np.float32),
+            orb_descs=np.zeros((8, 32), dtype=np.uint8),
+            orb_kps=np.zeros((8, 2), dtype=np.float32),
+        ), None
+
+    monkeypatch.setattr(grouper, "_process_one", fake_process)
+
+    first, skipped = grouper.compute_infos(str(tmp_path), engine="fast", workers=1)
+    assert skipped == []
+    assert len(first) == 1
+    assert calls == [str(img_path)]
+
+    calls.clear()
+    second, skipped = grouper.compute_infos(str(tmp_path), engine="fast", workers=1)
+    assert skipped == []
+    assert calls == []
+    assert second[0].phash == "a" * 16
+    np.testing.assert_array_equal(second[0].orb_descs, np.zeros((8, 32), dtype=np.uint8))
+
+    new_time = img_path.stat().st_mtime + 5
+    os.utime(img_path, (new_time, new_time))
+    calls.clear()
+    third, skipped = grouper.compute_infos(str(tmp_path), engine="fast", workers=1)
+    assert skipped == []
+    assert len(third) == 1
+    assert calls == [str(img_path)]

@@ -6,7 +6,10 @@
 from __future__ import annotations
 
 import io
+import hashlib
+import json
 import os
+import sqlite3
 import sys
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
@@ -46,6 +49,11 @@ RAW_EXTS = {
 
 ALL_INPUT_EXTS = IMAGE_EXTS | RAW_EXTS
 SKIP_DIR_NAMES = {"winners", "losers", "_pic_selecter"}
+CACHE_DIR_NAME = "_pic_selecter"
+ANALYSIS_CACHE_NAME = "cache.sqlite"
+ANALYSIS_CACHE_VERSION = 1
+PREVIEW_THUMB_MAX_SIDE = 1600
+PREVIEW_JPEG_QUALITY = 86
 
 # 分析尺寸：所有 AI 模型 / 质量算法吃的最大长边。
 # 相机原图 5152×7728 = 40MP → 直接喂 pyiqa CLIP 会 MPS OOM（34 GiB buffer）。
@@ -292,6 +300,231 @@ def _compute_orb(img_t: Image.Image, nfeatures: int = 500):
     return descs.astype(np.uint8), kps_arr
 
 
+# ---------------- 持久分析缓存 / 预览缓存 ----------------
+
+def _analysis_cache_path(folder: str) -> Path:
+    return Path(folder) / CACHE_DIR_NAME / ANALYSIS_CACHE_NAME
+
+
+def _open_analysis_cache(folder: str) -> sqlite3.Connection:
+    path = _analysis_cache_path(folder)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS image_info_cache (
+            cache_key TEXT PRIMARY KEY,
+            version INTEGER NOT NULL,
+            engine TEXT NOT NULL,
+            strength TEXT NOT NULL,
+            path TEXT NOT NULL,
+            source_signature TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            color_hist BLOB,
+            orb_descs BLOB,
+            orb_kps BLOB,
+            created_at REAL NOT NULL
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_image_info_cache_path "
+        "ON image_info_cache(path)"
+    )
+    return conn
+
+
+def _source_signature(path: str, companions: list[str]) -> str:
+    """Cache invalidator for the primary plus same-stem companion files."""
+    items = []
+    for p in [path, *companions]:
+        try:
+            st = os.stat(p)
+        except OSError:
+            items.append({"path": p, "missing": True})
+            continue
+        items.append({
+            "path": p,
+            "size": int(st.st_size),
+            "mtime_ns": int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000))),
+        })
+    return json.dumps(items, ensure_ascii=False, sort_keys=True)
+
+
+def _analysis_cache_key(path: str, engine: str, strength: str,
+                        face_aware: bool, llm_model: Optional[str]) -> str:
+    raw = "\0".join([
+        str(Path(path)),
+        engine,
+        strength,
+        "1" if face_aware else "0",
+        llm_model or "",
+    ]).encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()
+
+
+def _array_to_blob(arr: Any) -> Optional[bytes]:
+    if arr is None:
+        return None
+    buf = io.BytesIO()
+    np.save(buf, np.asarray(arr), allow_pickle=False)
+    return buf.getvalue()
+
+
+def _blob_to_array(blob: Optional[bytes]) -> Optional[np.ndarray]:
+    if blob is None:
+        return None
+    return np.load(io.BytesIO(blob), allow_pickle=False)
+
+
+def _info_payload(info: ImageInfo) -> str:
+    payload = {
+        "path": info.path,
+        "phash": info.phash,
+        "timestamp": info.timestamp,
+        "size": info.size,
+        "mtime": info.mtime,
+        "exif_summary": info.exif_summary,
+        "quality": info.quality,
+        "companions": info.companions,
+        "dinov2": None,
+        "aesthetic_score": info.aesthetic_score,
+        "musiq_score": info.musiq_score,
+        "clipiqa_score": info.clipiqa_score,
+        "face_embeddings": None,
+        "llm_verdict": info.llm_verdict,
+        "llm_reason": info.llm_reason,
+        "dhash": info.dhash,
+        "whash": info.whash,
+        "ahash": info.ahash,
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _info_from_payload(payload: str, row: sqlite3.Row) -> ImageInfo:
+    data = json.loads(payload)
+    data["color_hist"] = _blob_to_array(row["color_hist"])
+    data["orb_descs"] = _blob_to_array(row["orb_descs"])
+    data["orb_kps"] = _blob_to_array(row["orb_kps"])
+    return ImageInfo(**data)
+
+
+def _load_cached_info(
+    conn: sqlite3.Connection,
+    *,
+    path: str,
+    engine: str,
+    strength: str,
+    face_aware: bool,
+    llm_model: Optional[str],
+    source_signature: str,
+) -> Optional[ImageInfo]:
+    key = _analysis_cache_key(path, engine, strength, face_aware, llm_model)
+    row = conn.execute(
+        """
+        SELECT payload, color_hist, orb_descs, orb_kps
+        FROM image_info_cache
+        WHERE cache_key = ?
+          AND version = ?
+          AND source_signature = ?
+        """,
+        (key, ANALYSIS_CACHE_VERSION, source_signature),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        return _info_from_payload(row["payload"], row)
+    except Exception:
+        conn.execute("DELETE FROM image_info_cache WHERE cache_key = ?", (key,))
+        return None
+
+
+def _store_cached_info(
+    conn: sqlite3.Connection,
+    *,
+    info: ImageInfo,
+    engine: str,
+    strength: str,
+    face_aware: bool,
+    llm_model: Optional[str],
+    source_signature: str,
+) -> None:
+    key = _analysis_cache_key(info.path, engine, strength, face_aware, llm_model)
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO image_info_cache (
+            cache_key, version, engine, strength, path, source_signature, payload,
+            color_hist, orb_descs, orb_kps, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            key,
+            ANALYSIS_CACHE_VERSION,
+            engine,
+            strength,
+            info.path,
+            source_signature,
+            _info_payload(info),
+            _array_to_blob(info.color_hist),
+            _array_to_blob(info.orb_descs),
+            _array_to_blob(info.orb_kps),
+            datetime.now().timestamp(),
+        ),
+    )
+
+
+def _thumb_cache_key(rel: str, mtime: float, size: int, max_side: int) -> str:
+    s = f"{rel}|{int(mtime * 1000)}|{size}|{max_side}".encode("utf-8")
+    return hashlib.sha1(s).hexdigest()
+
+
+def _prewarm_preview_thumb(
+    folder: Optional[str],
+    path: str,
+    source_img: Image.Image,
+    max_side: int = PREVIEW_THUMB_MAX_SIDE,
+) -> bool:
+    """Write the same JPEG cache used by /api/image while the image is already open."""
+    if not folder:
+        return False
+    if Path(path).suffix.lower() not in IMAGE_EXTS:
+        return False
+    try:
+        st = os.stat(path)
+        rel = os.path.relpath(path, folder)
+    except OSError:
+        return False
+    key = _thumb_cache_key(rel, st.st_mtime, st.st_size, max_side)
+    cache_path = Path(folder) / CACHE_DIR_NAME / "thumbs" / f"{key}.jpg"
+    if cache_path.exists():
+        return False
+    tmp: Optional[Path] = None
+    try:
+        preview = source_img.copy()
+        try:
+            if max(preview.size) > max_side:
+                preview.thumbnail((max_side, max_side), Image.LANCZOS)
+            if preview.mode in ("RGBA", "P"):
+                preview = preview.convert("RGB")
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = cache_path.with_name(f".{cache_path.name}.{os.getpid()}.{id(source_img)}.tmp")
+            preview.save(tmp, "JPEG", quality=PREVIEW_JPEG_QUALITY)
+            tmp.replace(cache_path)
+            return True
+        finally:
+            try:
+                preview.close()
+            except Exception:
+                pass
+    except Exception:
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        return False
+
+
 # ---------------- 单文件处理 ----------------
 
 # IMAGE_EXTS 内的优先级：用作 RAW companion 时按这个顺序挑分析源
@@ -375,6 +608,7 @@ def _process_one(path: str, strength: str = "standard",
                  engine: str = "expert",
                  llm_model: Optional[str] = None,
                  companions: Optional[list[str]] = None,
+                 cache_folder: Optional[str] = None,
                  ) -> tuple[Optional[ImageInfo], Optional[str]]:
     """返回 (info, error_reason)。失败时 info=None。
 
@@ -402,7 +636,9 @@ def _process_one(path: str, strength: str = "standard",
         exif_sum = extract_exif_summary(img, st.st_size)
         # 应用 EXIF 旋转，然后**一次性压到分析尺寸**，下游所有模型/算法共用：
         # 原图 5152×7728 直接喂 pyiqa/CLIP 会 MPS OOM；统一压一次最干净。
-        img_t = _resize_for_analysis(ImageOps.exif_transpose(img))
+        img_oriented = ImageOps.exif_transpose(img)
+        _prewarm_preview_thumb(cache_folder, path, img_oriented)
+        img_t = _resize_for_analysis(img_oriented)
         ph = imagehash.phash(img_t, hash_size=8)
 
         if engine == "fast":
@@ -686,7 +922,19 @@ def compute_infos(
     needed: list[str] = []
     fresh: dict[str, ImageInfo] = {}
     skipped: list[tuple[str, str]] = []
-    # 一次性运行：每次都重新分析，不读旧缓存
+    source_signatures: dict[str, str] = {}
+    cache_conn: Optional[sqlite3.Connection] = None
+    cache_hits = 0
+    cache_writes = 0
+    if engine == "fast":
+        try:
+            cache_conn = _open_analysis_cache(folder)
+        except Exception as e:
+            log.warning(f"[fast] 分析缓存不可用，将全量重新计算：{type(e).__name__}: {e}")
+
+    total = len(files)
+    done = 0
+
     for idx, f in enumerate(files, 1):
         if idx % 256 == 0:
             _check_cancel()
@@ -694,11 +942,37 @@ def compute_infos(
             os.stat(f)
         except OSError as e:
             skipped.append((f, str(e)))
+            done += 1
             continue
+        source_sig = _source_signature(f, companions_by_primary.get(f, []))
+        source_signatures[f] = source_sig
+        if cache_conn is not None:
+            cached = _load_cached_info(
+                cache_conn,
+                path=f,
+                engine=engine,
+                strength=strength,
+                face_aware=face_aware,
+                llm_model=llm_model,
+                source_signature=source_sig,
+            )
+            if cached is not None:
+                cache_hits += 1
+                fresh[f] = cached
+                done += 1
+                name = os.path.basename(f)
+                if progress:
+                    progress(done, total, name)
+                if event_cb:
+                    try:
+                        event_cb(name, f, cached, None)
+                    except Exception:
+                        pass
+                continue
         needed.append(f)
 
-    total = len(files)
-    done = 0
+    if cache_conn is not None and files:
+        log.info(f"[fast] analysis cache: 命中 {cache_hits} / {len(files)}")
 
     if needed:
         # 工作线程数：
@@ -726,7 +1000,7 @@ def compute_infos(
                     return False
                 futures[ex.submit(
                     _process_one, f, strength, face_aware, engine, llm_model,
-                    companions_by_primary.get(f, []),
+                    companions_by_primary.get(f, []), folder,
                 )] = f
                 return True
 
@@ -794,6 +1068,22 @@ def compute_infos(
                     done += 1
                     if info:
                         fresh[info.path] = info
+                        if cache_conn is not None and f in source_signatures:
+                            try:
+                                _store_cached_info(
+                                    cache_conn,
+                                    info=info,
+                                    engine=engine,
+                                    strength=strength,
+                                    face_aware=face_aware,
+                                    llm_model=llm_model,
+                                    source_signature=source_signatures[f],
+                                )
+                                cache_writes += 1
+                                if cache_writes % 32 == 0:
+                                    cache_conn.commit()
+                            except Exception as e:
+                                log.debug(f"[fast] 写分析缓存失败 {Path(f).name}: {e}")
                     else:
                         skipped.append((f, reason or "未知原因"))
                     name = os.path.basename(f)
@@ -807,6 +1097,21 @@ def compute_infos(
                     _submit_next()
         finally:
             ex.shutdown(wait=False, cancel_futures=True)
+            if cache_conn is not None:
+                try:
+                    cache_conn.commit()
+                except Exception as e:
+                    log.debug(f"[fast] 提交分析缓存失败: {e}")
+                finally:
+                    cache_conn.close()
+                    cache_conn = None
+    if cache_conn is not None:
+        try:
+            cache_conn.commit()
+        except Exception as e:
+            log.debug(f"[fast] 提交分析缓存失败: {e}")
+        finally:
+            cache_conn.close()
 
     result_list = [fresh[f] for f in files if f in fresh]
 

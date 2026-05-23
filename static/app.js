@@ -2437,7 +2437,7 @@ $("btn-redo-folder").addEventListener("click", async () => {
   if (!s || !s.folder) { toast("没有可重做的会话"); return; }
   const ok = await confirmDialog(
     "重做这个文件夹",
-    `将清掉 ${s.folder}/winners 与 /losers 子目录、所有缓存与本次进度，` +
+    `将清掉 ${s.folder}/winners 与 /losers 子目录和本次进度，保留可复用的分析缓存，` +
     `用同样的设置（${s.mode === "move" ? "移动" : "复制"}模式` +
     `${s.dry_run ? "、试运行" : ""}）重新分组挑选。\n\n这步不可撤销，确定继续？`
   );

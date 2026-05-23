@@ -1,6 +1,7 @@
 import importlib
 import sys
 import types
+from pathlib import Path
 
 from PIL import Image, ImageFilter, ImageDraw
 
@@ -73,22 +74,23 @@ def test_quality_info_can_be_serialized_to_plain_dict():
     assert isinstance(data["flags"], list)
 
 
-def test_grouper_cache_round_trips_quality_metrics(tmp_path):
+def test_scan_folder_pairs_raw_with_jpg_and_skips_root_outputs(tmp_path):
     sys.modules.setdefault("imagehash", types.SimpleNamespace(phash=lambda *args, **kwargs: "0" * 16))
     grouper = importlib.import_module("pic_selecter.grouper")
-    ImageInfo = grouper.ImageInfo
-    photo = tmp_path / "a.jpg"
-    photo.write_bytes(b"fake")
-    info = ImageInfo(
-        path=str(photo),
-        phash="0" * 16,
-        size=photo.stat().st_size,
-        mtime=photo.stat().st_mtime,
-        quality={"quality_score": 72.5, "flags": ["blurry"], "reject_reason": "画面模糊"},
-    )
+    (tmp_path / "IMG_0001.CR2").write_bytes(b"raw")
+    (tmp_path / "IMG_0001.JPG").write_bytes(b"jpg")
+    (tmp_path / "winners").mkdir()
+    (tmp_path / "winners" / "old.jpg").write_bytes(b"old")
+    (tmp_path / "nested").mkdir()
+    (tmp_path / "nested" / "winners").mkdir()
+    (tmp_path / "nested" / "winners" / "kept.jpg").write_bytes(b"kept")
 
-    grouper._save_cache(str(tmp_path), {str(photo): info})
-    loaded = grouper._load_cache(str(tmp_path))
+    pairs = grouper.scan_folder(str(tmp_path))
 
-    assert loaded[str(photo)].quality["quality_score"] == 72.5
-    assert loaded[str(photo)].quality["flags"] == ["blurry"]
+    simplified = {
+        Path(primary).name: [Path(c).name for c in companions]
+        for primary, companions in pairs
+    }
+    assert simplified["IMG_0001.CR2"] == ["IMG_0001.JPG"]
+    assert "old.jpg" not in simplified
+    assert simplified["kept.jpg"] == []

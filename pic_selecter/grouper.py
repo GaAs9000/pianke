@@ -8,7 +8,7 @@ from __future__ import annotations
 import io
 import os
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -45,6 +45,7 @@ RAW_EXTS = {
 }
 
 ALL_INPUT_EXTS = IMAGE_EXTS | RAW_EXTS
+SKIP_DIR_NAMES = {"winners", "losers", "_pic_selecter"}
 
 # 分析尺寸：所有 AI 模型 / 质量算法吃的最大长边。
 # 相机原图 5152×7728 = 40MP → 直接喂 pyiqa CLIP 会 MPS OOM（34 GiB buffer）。
@@ -554,7 +555,10 @@ def _process_one(path: str, strength: str = "standard",
                 pass
 
 
-def scan_folder(folder: str) -> list[tuple[str, list[str]]]:
+def scan_folder(
+    folder: str,
+    cancel_check: Optional[Callable[[], bool]] = None,
+) -> list[tuple[str, list[str]]]:
     """递归扫描所有受支持的文件，按 (目录, stem) 配对。
 
     返回 [(primary_path, companions), ...]：
@@ -567,26 +571,48 @@ def scan_folder(folder: str) -> list[tuple[str, list[str]]]:
     用 companion JPG 或 RAW 内嵌预览来加载）。搬运时 primary 和所有 companions
     一起搬到相同目标目录、共享 stem。
     """
-    p = Path(folder)
+    def _check_cancel() -> None:
+        if cancel_check and cancel_check():
+            raise CancelledError()
+
+    root_dir = str(Path(folder))
     # 按 (parent_dir, stem.lower()) 聚合候选文件
     groups: dict[tuple[str, str], list[str]] = {}
-    for root, _, names in os.walk(p):
-        rel = Path(root).relative_to(p)
-        if rel.parts and rel.parts[0] in {"winners", "losers", "_pic_selecter"}:
+    stack = [root_dir]
+    seen_entries = 0
+    while stack:
+        _check_cancel()
+        root = stack.pop()
+        try:
+            with os.scandir(root) as entries:
+                for entry in entries:
+                    seen_entries += 1
+                    if seen_entries % 512 == 0:
+                        _check_cancel()
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            if not (root == root_dir and entry.name in SKIP_DIR_NAMES):
+                                stack.append(entry.path)
+                            continue
+                        if not entry.is_file(follow_symlinks=False):
+                            continue
+                    except OSError:
+                        continue
+
+                    stem, suffix = os.path.splitext(entry.name)
+                    suffix = suffix.lower()
+                    if suffix not in ALL_INPUT_EXTS:
+                        continue
+                    key = (root, stem.lower())
+                    groups.setdefault(key, []).append(entry.path)
+        except OSError:
             continue
-        for n in names:
-            suffix = Path(n).suffix.lower()
-            if suffix not in ALL_INPUT_EXTS:
-                continue
-            full = str(Path(root) / n)
-            key = (root, Path(n).stem.lower())
-            groups.setdefault(key, []).append(full)
 
     result: list[tuple[str, list[str]]] = []
     for files in groups.values():
         files.sort()  # 稳定顺序
-        raws = [f for f in files if Path(f).suffix.lower() in RAW_EXTS]
-        non_raws = [f for f in files if Path(f).suffix.lower() in IMAGE_EXTS]
+        raws = [f for f in files if os.path.splitext(f)[1].lower() in RAW_EXTS]
+        non_raws = [f for f in files if os.path.splitext(f)[1].lower() in IMAGE_EXTS]
         if raws:
             primary = raws[0]
             companions = raws[1:] + non_raws
@@ -623,10 +649,17 @@ def compute_infos(
     """
     import logging
     log = logging.getLogger("pic_selecter")
-    pairs = scan_folder(folder)
+
+    def _check_cancel():
+        if cancel_check and cancel_check():
+            raise CancelledError()
+
+    _check_cancel()
+    pairs = scan_folder(folder, cancel_check=cancel_check)
+    _check_cancel()
     companions_by_primary: dict[str, list[str]] = {p: c for p, c in pairs}
     files = [p for p, _ in pairs]
-    raw_count = sum(1 for p in files if Path(p).suffix.lower() in RAW_EXTS)
+    raw_count = sum(1 for p in files if os.path.splitext(p)[1].lower() in RAW_EXTS)
     companion_count = sum(len(c) for c in companions_by_primary.values())
     log.info(
         f"[{engine}] scan_folder: 发现 {len(files)} 张 primary"
@@ -638,8 +671,8 @@ def compute_infos(
     # 后者会让用户对着"50 张照片只剩 10 张能处理"困惑半天。
     raw_without_jpg_companion = [
         p for p, comps in pairs
-        if Path(p).suffix.lower() in RAW_EXTS
-        and not any(Path(c).suffix.lower() in IMAGE_EXTS for c in comps)
+        if os.path.splitext(p)[1].lower() in RAW_EXTS
+        and not any(os.path.splitext(c)[1].lower() in IMAGE_EXTS for c in comps)
     ]
     if raw_without_jpg_companion:
         try:
@@ -654,7 +687,9 @@ def compute_infos(
     fresh: dict[str, ImageInfo] = {}
     skipped: list[tuple[str, str]] = []
     # 一次性运行：每次都重新分析，不读旧缓存
-    for f in files:
+    for idx, f in enumerate(files, 1):
+        if idx % 256 == 0:
+            _check_cancel()
         try:
             os.stat(f)
         except OSError as e:
@@ -664,10 +699,6 @@ def compute_infos(
 
     total = len(files)
     done = 0
-
-    def _check_cancel():
-        if cancel_check and cancel_check():
-            raise CancelledError()
 
     if needed:
         # 工作线程数：
@@ -685,13 +716,25 @@ def compute_infos(
                 workers = min(8, max(2, (os.cpu_count() or 4)))
         ex = ThreadPoolExecutor(max_workers=workers)
         try:
-            futures = {
-                ex.submit(
+            next_file = iter(needed)
+            futures: dict = {}
+
+            def _submit_next() -> bool:
+                try:
+                    f = next(next_file)
+                except StopIteration:
+                    return False
+                futures[ex.submit(
                     _process_one, f, strength, face_aware, engine, llm_model,
                     companions_by_primary.get(f, []),
-                ): f
-                for f in needed
-            }
+                )] = f
+                return True
+
+            max_pending = max(1, min(len(needed), workers * 2))
+            for _ in range(max_pending):
+                if not _submit_next():
+                    break
+
             # A6 修复：区分"能力级异常"（让整任务挂）和"图级异常"（这张 skip）
             # 能力级 = LLM 不可用 / vision 模型崩 / torch OOM / cv2 contrib 缺 ——
             # 这些通常意味着所有后续图都会同样失败，500 张图静默 skip 是最糟的体验。
@@ -721,39 +764,47 @@ def compute_infos(
                     "onnxruntime", "could not load library",
                 ))
 
-            for fut in as_completed(futures):
+            while futures:
                 _check_cancel()
-                f = futures[fut]
-                info = None
-                reason: Optional[str] = None
-                try:
-                    result = fut.result()
-                    if isinstance(result, tuple):
-                        info, reason = result
-                    else:
-                        info = result
-                except _FutCancelled:
-                    raise CancelledError()
-                except Exception as e:
-                    if _is_fatal_capability(e):
-                        log.error(
-                            f"[{engine}] worker 遇到能力级异常，整任务终止："
-                            f"{type(e).__name__}: {e}"
-                        )
-                        raise
-                    reason = f"worker error: {type(e).__name__}: {e}"
-                done += 1
-                if info:
-                    fresh[info.path] = info
-                else:
-                    skipped.append((f, reason or "未知原因"))
-                if progress:
-                    progress(done, total, Path(f).name)
-                if event_cb:
+                completed, _ = wait(
+                    futures, timeout=0.2, return_when=FIRST_COMPLETED
+                )
+                if not completed:
+                    continue
+                for fut in completed:
+                    f = futures.pop(fut)
+                    info = None
+                    reason: Optional[str] = None
                     try:
-                        event_cb(Path(f).name, f, info, reason)
-                    except Exception:
-                        pass
+                        result = fut.result()
+                        if isinstance(result, tuple):
+                            info, reason = result
+                        else:
+                            info = result
+                    except _FutCancelled:
+                        raise CancelledError()
+                    except Exception as e:
+                        if _is_fatal_capability(e):
+                            log.error(
+                                f"[{engine}] worker 遇到能力级异常，整任务终止："
+                                f"{type(e).__name__}: {e}"
+                            )
+                            raise
+                        reason = f"worker error: {type(e).__name__}: {e}"
+                    done += 1
+                    if info:
+                        fresh[info.path] = info
+                    else:
+                        skipped.append((f, reason or "未知原因"))
+                    name = os.path.basename(f)
+                    if progress:
+                        progress(done, total, name)
+                    if event_cb:
+                        try:
+                            event_cb(name, f, info, reason)
+                        except Exception:
+                            pass
+                    _submit_next()
         finally:
             ex.shutdown(wait=False, cancel_futures=True)
 

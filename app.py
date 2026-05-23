@@ -2737,7 +2737,7 @@ def _validate_path_under_folder(raw: str) -> Optional[Path]:
 
 @app.route("/api/image")
 def api_image():
-    """每次都现解、不写盘缓存。SESSION 不存在时也允许（着陆页样图 / 处理页流缩略图）。"""
+    """返回网页预览图；会在当前照片目录下缓存已缩放 JPEG。"""
     raw = request.args.get("path", "")
     if not raw:
         return _placeholder_response()
@@ -2747,16 +2747,40 @@ def api_image():
         max_side = THUMB_MAX
     max_side = max(64, min(max_side, THUMB_MAX))
 
+    session = SESSION
     p = Path(raw).resolve()
+    rel_for_cache = str(p)
     # 有 session 时校验路径必须在 folder 内（防止 session 期间被钓鱼路径打到任意文件）；
     # 没 session 时只要文件存在即可（着陆页 peek 样图 / 处理页流缩略图）
-    if SESSION is not None:
+    if session is not None:
+        base = Path(session.folder).resolve()
         try:
-            p.relative_to(Path(SESSION.folder).resolve())
+            rel_for_cache = str(p.relative_to(base))
         except ValueError:
             return _placeholder_response()
     if not p.exists() or not p.is_file():
         return _placeholder_response()
+    try:
+        st = p.stat()
+    except OSError:
+        return _placeholder_response()
+
+    cache_path: Optional[Path] = None
+    cache_key: Optional[str] = None
+    if session is not None:
+        cache_key = _thumb_cache_key(rel_for_cache, st.st_mtime, st.st_size, max_side)
+        cache_path = thumbs_dir(session.folder) / f"{cache_key}.jpg"
+        if cache_path.exists():
+            try:
+                return send_file(
+                    cache_path,
+                    mimetype="image/jpeg",
+                    max_age=86400,
+                    etag=cache_key,
+                    conditional=True,
+                )
+            except Exception:
+                pass
 
     try:
         # _safe_open_image 内部已经处理 RAW（走 rawpy.extract_thumb），
@@ -2773,8 +2797,31 @@ def api_image():
             buf = io.BytesIO()
             img.save(buf, "JPEG", quality=86)
             data_bytes = buf.getvalue()
+            if cache_path is not None and cache_key is not None:
+                tmp: Optional[Path] = None
+                try:
+                    cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = cache_path.with_name(
+                        f".{cache_path.name}.{uuid.uuid4().hex}.tmp"
+                    )
+                    tmp.write_bytes(data_bytes)
+                    tmp.replace(cache_path)
+                    return send_file(
+                        cache_path,
+                        mimetype="image/jpeg",
+                        max_age=86400,
+                        etag=cache_key,
+                        conditional=True,
+                    )
+                except Exception as e:
+                    if tmp is not None:
+                        try:
+                            tmp.unlink()
+                        except OSError:
+                            pass
+                    logger.debug(f"缩略图缓存写入失败 {cache_path}: {e}")
             resp = Response(data_bytes, mimetype="image/jpeg")
-            resp.headers["Cache-Control"] = "no-store"
+            resp.headers["Cache-Control"] = "public, max-age=3600"
             return resp
         finally:
             try:
@@ -2829,22 +2876,29 @@ def api_image_original():
 
 # ---------------- 其它接口 ----------------
 
+def _actual_winner_path(raw_path: str, winners_root: Path) -> str:
+    actual = Path(raw_path)
+    if actual.exists():
+        return str(actual)
+    candidate = winners_root / actual.name
+    if candidate.exists():
+        return str(candidate)
+    return raw_path
+
+
 @app.route("/api/winners")
 def api_winners():
     if SESSION is None:
         return jsonify({"winners": []})
     out = []
+    win_root = winners_dir(SESSION.folder)
     for i, g in enumerate(SESSION.groups):
         winners_in_group = []
         if g.winner:
             winners_in_group.append(g.winner)
         winners_in_group.extend(g.extra_winners)
         for w in winners_in_group:
-            actual = w
-            if not Path(actual).exists():
-                candidate = winners_dir(SESSION.folder) / Path(actual).name
-                if candidate.exists():
-                    actual = str(candidate)
+            actual = _actual_winner_path(w, win_root)
             out.append({
                 "path": actual,
                 "name": Path(w).name,
@@ -3536,13 +3590,10 @@ def _winner_paths() -> list[str]:
     if SESSION is None:
         return []
     paths: list[str] = []
+    win_root = winners_dir(SESSION.folder)
     for g in SESSION.groups:
         for w in ([g.winner] if g.winner else []) + list(g.extra_winners):
-            actual = w
-            if not Path(actual).exists():
-                cand = winners_dir(SESSION.folder) / Path(actual).name
-                if cand.exists():
-                    actual = str(cand)
+            actual = _actual_winner_path(w, win_root)
             if Path(actual).exists():
                 paths.append(actual)
     return paths
